@@ -4,4 +4,14 @@ version = "0.1.0"
 description = "Classify food items based on OpenFoodFacts categories"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "duckdb>=2.0.0",
+    "pandas>=3.1.1",
+    "pyarrow>=26.0.1",
+    "scikit-learn>=1.9.1",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu132"
