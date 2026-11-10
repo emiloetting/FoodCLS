@@ -38,3 +38,4 @@ def get_category_tags(value):
             if tag and tag != "null":
                 tags.append(tag)
     return tags
+

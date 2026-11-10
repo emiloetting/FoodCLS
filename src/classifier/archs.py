@@ -15,7 +15,7 @@ class MLP(nn.Module):
         self.hidden2 = nn.Linear(self.hidden1.out_features, 100)
         self.hidden3 = nn.Linear(self.hidden2.out_features, classes)
 
-        self.softmax = nn.Softmax(self.hidden3.out_features)
+        self.softmax = nn.Softmax(1)
         self.leaky_r = nn.LeakyReLU(inplace=True)
         self.dropout1 = nn.Dropout(p=dropout_perc)
         self.dropout2 = nn.Dropout(p=dropout_perc)
