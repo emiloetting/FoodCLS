@@ -78,7 +78,7 @@ class FoodDataset(Dataset):
     def __init__(self, onehot_vectors, labels):
         super().__init__()
         if not isinstance(onehot_vectors, torch.Tensor):
-            onehot_vectors = torch.tensor(onehot_vectors)
+            onehot_vectors = torch.stack(onehot_vectors)
         if not isinstance(labels, torch.Tensor):
             labels = torch.tensor(labels)
 
@@ -101,10 +101,6 @@ class FoodDataset(Dataset):
             test_size=part2,
             shuffle=True,
             stratify=self.labels)
-        X1 = torch.tensor(X1)
-        X2 = torch.tensor(X2)
-        y1 = torch.tensor(y1)
-        y2 = torch.tensor(y2)
         train_ds = FoodDataset(X1, y1)
         test_ds = FoodDataset(X2, y2)
         return train_ds, test_ds
