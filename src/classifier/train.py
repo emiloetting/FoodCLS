@@ -13,13 +13,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from classifier.preparation import DataProcessor, FoodDataset
-from classifier.archs import MLP
+from classifier.classifiers import MLP
 
 CRITERION = torch.nn.CrossEntropyLoss
 OPTIMIZER = torch.optim.Adam
-BATCH_SIZE = 2**15
+BATCH_SIZE = 4096
 MODEL = MLP
-EPOCHS = 100
+EPOCHS = 50
 RUNS = 3
 
 # Create dir to keep contents form training run
@@ -49,48 +49,41 @@ store_dir = {
 with open(models_dir/"meta.json", "w", encoding="utf-8") as f:
     json.dump(store_dir, f, ensure_ascii=False)
 
-
 # Collect data for training
 db_parquet = Path(config["original_db"])  # extract path to db
-tags_csv_pth = Path(config["tags_csv"])
 
 # Load data dirty (all in RAM)
-if not tags_csv_pth.is_file():
-    res_df = ddb.sql(
-        f"SELECT code, categories_tags FROM read_parquet('{db_parquet.resolve().as_posix()}')"
-    ).df()
+print("Loading from DB into DataFrame...")
+res_df = ddb.sql(
+    f"SELECT code, categories_tags FROM read_parquet('{db_parquet.resolve().as_posix()}')"
+).df()
 
-else:
-    print("Loading data from csv...")
-    res_df = pd.read_csv(
-        tags_csv_pth,
-        usecols=lambda column: column not in ["Unnamed: 0", "product_name"],    # ignore product name since not important for inference
-        dtype={"code": "string"},
-    )
 
 # Init processor to ship with model
-processor = DataProcessor(
-   Path(config["orig_unique_categories_json"]).resolve()
-)
-processor.save_to_pkl(models_dir/"processor.pkl")
+processor = DataProcessor()
+processor.load_vocab(config["vocab_json"])
+processor.save(models_dir/"processor.pkl")
+
 
 # Load dict with barcode-label mappings
 print("Collecting tags...")
-with open(config["codes_for_training_json"], "r", encoding="utf-8") as f:
-    llm_mapping_dict = json.load(f)     # dirty-assume dict (I created the file..)
-normalized_mapping = {
-    str(code).lstrip("0") or "0": label
-    for code, label in llm_mapping_dict.items()
-}
-normalized_codes = res_df["code"].astype("string").str.lstrip("0").replace("", "0")
-mapped_labels = normalized_codes.map(normalized_mapping)
-matched = mapped_labels.notna()
-training_rows = res_df.loc[matched, ["categories_tags"]].copy()
-training_rows["label"] = mapped_labels.loc[matched].astype("int64")
+with open(config["barcode_mapping"], "r", encoding="utf-8") as f:
+    barcode_mapping = json.load(f)
+
+# Assign labels by barcode, preserving leading zeros.
+training_rows = res_df[["categories_tags"]].copy()
+training_rows["label"] = res_df["code"].astype("string").str.strip().map(barcode_mapping)
+training_rows = training_rows.dropna(subset=["label"])
+training_rows["label"] = training_rows["label"].astype("int64")
+print(f"Label coverage: {len(training_rows):,} / {len(res_df):,} product rows")
+
+# Keep only products with tags recognized by the processor.
 training_rows["categories_tags"] = training_rows["categories_tags"].apply(
     processor.normalize_tags
 )
 training_rows = training_rows[training_rows["categories_tags"].str.len() > 0]
+if training_rows.empty:
+    raise ValueError("No products with both a mapped label and known tags remain.")
 to_embed = training_rows["categories_tags"].tolist()
 labels = training_rows["label"].tolist()
 
@@ -99,21 +92,21 @@ print("Labels: ", len(labels))
 print("Unique labels: ", set(labels))
 print()
 
-# Create embeddings and build dataset
-embeds = [processor.vectorize_tags(tag_list) for tag_list in to_embed]
-
 # Build datasets and dataloader
-grand_ds = FoodDataset(embeds, labels)
-train_ds, rest_ds = grand_ds._data_split(0.7, 0.3)
-val_ds, test_ds = rest_ds._data_split(0.67, 0.33)
+grand_ds = FoodDataset(to_embed, labels, processor)
+train_ds, rest_ds = grand_ds._data_split(0.7, 0.3, random_state=int(config["seed"]))
+val_ds, test_ds = rest_ds._data_split(0.67, 0.33, random_state=int(config["seed"]))
 
 train_loader = torch.utils.data.DataLoader(train_ds, BATCH_SIZE, shuffle=True)
 val_loader = torch.utils.data.DataLoader(val_ds, BATCH_SIZE, shuffle=True)
 test_loader = torch.utils.data.DataLoader(test_ds, BATCH_SIZE, shuffle=True)
 
-del embeds
+del to_embed
+del grand_ds
+del rest_ds
 del res_df
-del llm_mapping_dict
+del barcode_mapping
+del training_rows
 
 run_tqdm = {
     "iterable": range(RUNS),
@@ -129,23 +122,13 @@ epoch_tqdm = {
     "desc": "Epoch"
 }
 
-with open(config["target_classes"], "r", encoding="utf-8") as f:
-    target_class_mapping = json.load(f)
-
-amnt_classes = len(target_class_mapping.keys())
 
 # Actual training
 for run in tqdm(**run_tqdm):
     this_dir = models_dir / str(run)
     this_dir.mkdir(parents=True, exist_ok=True)
 
-    model = MODEL(
-        in_dims=processor.nr_of_known_tags,
-        dropout_perc=0.2,
-        classes=amnt_classes,
-        label_mapping={}
-    )
-    model.to(DEVICE)
+    model = MODEL(processor.nr_of_known_tags).to(DEVICE)
 
     criterion = CRITERION()
     optimizer = OPTIMIZER(model.parameters(), lr=0.001)
@@ -156,6 +139,8 @@ for run in tqdm(**run_tqdm):
 
         correct = 0
         total = 0
+        initial_preds = []
+        initial_targets = []
 
         for vectors, labels in tqdm(train_loader, "batches", len(train_loader), False):
             vectors = vectors.to(DEVICE).float()
@@ -166,8 +151,11 @@ for run in tqdm(**run_tqdm):
 
             correct += (predictions == labels).sum().item()
             total += labels.size(0)
+            initial_preds.extend(predictions.cpu().tolist())
+            initial_targets.extend(labels.cpu().tolist())
 
-        tqdm.write(f"Run {run} | Initial Accuracy: {correct / total:.4f} | Initial F1: {f1_score(labels.cpu().numpy(), predictions.cpu().numpy(), average="macro", zero_division=0):.4f}")
+        initial_f1 = f1_score(initial_targets, initial_preds, average="macro", zero_division=0)
+        tqdm.write(f"Run {run} | Initial Accuracy: {correct / total:.4f} | Initial F1: {initial_f1:.4f}")
 
     best_val_loss = float("inf")    # to always store best model
     history = []
@@ -239,7 +227,7 @@ for run in tqdm(**run_tqdm):
             f"Train Loss: {metrics['train_loss']:.4f} | "
             f"Train Acc: {metrics['train_accuracy']:.4f} | "
             f"Val Loss: {metrics['val_loss']:.4f} | "
-            f"Val Acc: {metrics['val_accuracy']:.4f} |"
+            f"Val Acc: {metrics['val_accuracy']:.4f} | "
             f"Val Macro F1: {metrics['val_macro_f1']:.4f}"
             ""
         )
@@ -277,9 +265,11 @@ for run in tqdm(**run_tqdm):
             test_preds.extend(outputs.argmax(dim=1).cpu().tolist())
             test_targets.extend(labels.cpu().tolist())
 
-            test_macro_f1 = f1_score(
-                test_targets, test_preds, average="macro", zero_division=0
-            )
+    test_macro_f1 = f1_score(
+        test_targets, test_preds, average="macro", zero_division=0
+    )
 
-print(f"Run {run} | Test Macro F1: {test_macro_f1:.4f}")
-print(f"Run {run} | Test Accuracy: {test_correct / test_total:.4f}")
+    print(f"Run {run} | Test Macro F1: {test_macro_f1:.4f}")
+    print(f"Run {run} | Test Accuracy: {test_correct / test_total:.4f}")
+    with open(this_dir / "test_metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"accuracy": test_correct / test_total, "macro_f1": test_macro_f1}, f)
