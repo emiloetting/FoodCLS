@@ -14,7 +14,10 @@ def _read_quoted_text(value):
     return ast.literal_eval(value.translate(_CONTROL_ESCAPES))
 
 
-def get_category_tags(value):
+def get_category_tags(value, *, allow_normalized=False):
+    """Normalize English tags; optionally accept tags with no language prefix."""
+    if isinstance(value, Mapping):
+        return []
     if isinstance(value, str):
         # CSV stores NumPy arrays as quoted strings without separating commas.
         values = [
@@ -35,6 +38,9 @@ def get_category_tags(value):
         tag = value.lower().strip()
         if tag.startswith("en:"):
             tag = tag[3:].strip()
-            if tag and tag != "null":
-                tags.append(tag)
+        elif not allow_normalized or ":" in tag:
+            continue
+        if tag and tag != "null":
+            tags.append(tag)
     return tags
+
